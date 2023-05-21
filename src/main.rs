@@ -73,6 +73,37 @@ impl<G: rand::Rng + Send + Sync> QuoteGen<G> {
 async fn main() {
     let cli = Cli::parse();
 
+    let quotes: Vec<_> = include_str!("../quotes.txt")
+        .split_inclusive('\n')
+        .collect();
+
+    if let Some(graceful_shutdown) = run(std::io::stdout(), cli, quotes).await {
+        signal::ctrl_c().await.unwrap();
+
+        graceful_shutdown.stop().await;
+    }
+}
+
+struct ServerStopper {
+    ask_stop: tokio::sync::watch::Sender<bool>,
+    wait_tcp_stopped: Receiver<()>,
+    wait_udp_stopped: Receiver<()>,
+}
+
+impl ServerStopper {
+    async fn stop(self) {
+        println!("stopping TCP and UDP servers...");
+        self.ask_stop.send(true).unwrap();
+        self.wait_tcp_stopped.await.unwrap();
+        self.wait_udp_stopped.await.unwrap();
+    }
+}
+
+async fn run<W: std::io::Write>(
+    mut w: W,
+    cli: Cli,
+    quotes: Vec<&'static str>,
+) -> Option<ServerStopper> {
     let seed = cli.seed.unwrap_or_else(|| {
         time::SystemTime::now()
             .duration_since(time::UNIX_EPOCH)
@@ -81,13 +112,13 @@ async fn main() {
     });
 
     let gen = rand::rngs::StdRng::seed_from_u64(seed);
-    let quotes: Vec<_> = include_str!("../quotes.txt")
-        .split_inclusive('\n')
-        .collect();
     let quotes = Arc::new(RwLock::new(QuoteGen { gen, quotes }));
 
     match cli.command {
-        CliCommand::Generate => print!("{}", quotes.write().unwrap().generate()),
+        CliCommand::Generate => {
+            write!(w, "{}", quotes.write().unwrap().generate()).unwrap();
+            None
+        }
         CliCommand::Server(opts) => {
             let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
             let (tcp_server_stopped_tx, tcp_server_stopped_rx): (Sender<()>, Receiver<()>) =
@@ -112,12 +143,11 @@ async fn main() {
             tcp_server.await;
             udp_server.await;
 
-            signal::ctrl_c().await.unwrap();
-
-            println!("stopping TCP and UDP servers...");
-            stop_tx.send(true).unwrap();
-            tcp_server_stopped_rx.await.unwrap();
-            udp_server_stopped_rx.await.unwrap();
+            Some(ServerStopper {
+                ask_stop: stop_tx,
+                wait_tcp_stopped: tcp_server_stopped_rx,
+                wait_udp_stopped: udp_server_stopped_rx,
+            })
         }
     }
 }
@@ -176,31 +206,53 @@ async fn spawn_udp_server<R: rand::Rng + Send + Sync + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, RwLock};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    use rand::SeedableRng;
-    use tokio::{
-        io::{AsyncReadExt, AsyncWriteExt},
-        sync::oneshot::{Receiver, Sender},
-    };
+    #[tokio::test]
+    async fn generate() {
+        let quotes = vec!["my quote of the day\n"];
+
+        let cli = super::Cli {
+            seed: Some(1),
+            command: crate::CliCommand::Generate,
+        };
+
+        let mut buf = Vec::new();
+
+        assert!(
+            super::run(&mut buf, cli, quotes).await.is_none(),
+            "did not expect cleanup function"
+        );
+
+        assert_eq!("my quote of the day\n".as_bytes(), buf)
+    }
 
     #[tokio::test]
     async fn udp_server() {
-        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        let (server_stopped_tx, server_stopped_rx): (Sender<()>, Receiver<()>) =
-            tokio::sync::oneshot::channel();
-        let gen = rand::rngs::StdRng::seed_from_u64(1);
         let quotes = vec!["my quote of the day\n"];
-        let quotes = Arc::new(RwLock::new(super::QuoteGen { gen, quotes }));
 
-        let server_addr = "127.0.0.1:10000";
-        super::spawn_udp_server(server_addr.to_string(), server_stopped_tx, stop_rx, quotes).await;
+        let udp_address: std::net::SocketAddr = "127.0.0.1:10004"
+            .parse()
+            .expect("failed to build server address");
+
+        let cli = super::Cli {
+            seed: Some(1),
+            command: crate::CliCommand::Server(super::CliCommandServer {
+                tcp_address: "127.0.0.1:10003".to_string(),
+                udp_address: udp_address.to_string(),
+            }),
+        };
+
+        let mut stdout = Vec::new();
+        let stopper = super::run(&mut stdout, cli, quotes)
+            .await
+            .expect("failed to get server stopping function");
 
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("failed to bind UDP client");
         client
-            .connect(server_addr)
+            .connect(udp_address)
             .await
             .expect("failed to connect to server");
 
@@ -216,25 +268,33 @@ mod tests {
 
         assert_eq!("my quote of the day\n".as_bytes(), buf);
 
-        stop_tx.send(true).unwrap();
-        server_stopped_rx.await.unwrap();
+        stopper.stop().await;
     }
 
     #[tokio::test]
     async fn tcp_server() {
-        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-        let (server_stopped_tx, server_stopped_rx): (Sender<()>, Receiver<()>) =
-            tokio::sync::oneshot::channel();
-        let gen = rand::rngs::StdRng::seed_from_u64(1);
         let quotes = vec!["my quote of the day\n"];
-        let quotes = Arc::new(RwLock::new(super::QuoteGen { gen, quotes }));
 
-        let server_addr = "127.0.0.1:10001";
-        super::spawn_tcp_server(server_addr.to_string(), server_stopped_tx, stop_rx, quotes).await;
+        let tcp_address: std::net::SocketAddr = "127.0.0.1:10001"
+            .parse()
+            .expect("failed to build server address");
+
+        let cli = super::Cli {
+            seed: Some(1),
+            command: crate::CliCommand::Server(super::CliCommandServer {
+                tcp_address: tcp_address.to_string(),
+                udp_address: "127.0.0.1:10002".to_string(),
+            }),
+        };
+
+        let mut stdout = Vec::new();
+        let stopper = super::run(&mut stdout, cli, quotes)
+            .await
+            .expect("failed to get server stopping function");
 
         let client = tokio::net::TcpSocket::new_v4().expect("failed to create client TCP socket");
         let mut client_stream = client
-            .connect(server_addr.parse().unwrap())
+            .connect(tcp_address)
             .await
             .expect("failed to connect to server");
 
@@ -251,7 +311,6 @@ mod tests {
 
         assert_eq!("my quote of the day\n".as_bytes(), buf);
 
-        stop_tx.send(true).unwrap();
-        server_stopped_rx.await.unwrap();
+        stopper.stop().await;
     }
 }
